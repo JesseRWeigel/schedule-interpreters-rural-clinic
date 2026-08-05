@@ -12,3 +12,8 @@ __pycache__/
 dist/
 build/
 .next/
+*.db
+*.db-shm
+*.db-wal
+outbox/
+reports/
