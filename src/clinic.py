@@ -450,34 +450,28 @@ def _optimal_batch_plan(
         interpreter_id: index for index, interpreter_id in enumerate(ordered_interpreters)
     }
     empty_state = tuple("" for _ in ordered_interpreters)
-    empty_counts = tuple(0 for _ in ordered_interpreters)
-    states: dict[
-        tuple[str, ...], tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]]
-    ] = {
-        empty_state: (0, 0, empty_counts, ())
+    states: dict[tuple[str, ...], tuple[int, tuple[tuple[int, int], ...]]] = {
+        empty_state: (0, ())
     }
 
     def is_better(
-        candidate: tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]],
-        current: tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]] | None,
+        candidate: tuple[int, tuple[tuple[int, int], ...]],
+        current: tuple[int, tuple[tuple[int, int], ...]] | None,
     ) -> bool:
         if current is None:
             return True
-        candidate_count, candidate_cost, _, candidate_plan = candidate
-        current_count, current_cost, _, current_plan = current
+        candidate_count, candidate_plan = candidate
+        current_count, current_plan = current
         return (
             candidate_count > current_count
             or (
                 candidate_count == current_count
-                and (candidate_cost, candidate_plan) < (current_cost, current_plan)
+                and candidate_plan < current_plan
             )
         )
 
     for appointment in appointments:
-        normalized_states: dict[
-            tuple[str, ...],
-            tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]],
-        ] = {}
+        normalized_states: dict[tuple[str, ...], tuple[int, tuple[tuple[int, int], ...]]] = {}
         for busy_until, value in states.items():
             normalized_busy = tuple(
                 end if end > appointment["starts_at"] else "" for end in busy_until
@@ -487,7 +481,7 @@ def _optimal_batch_plan(
 
         next_states = dict(normalized_states)
         candidate_ids = candidates_by_appointment[appointment["id"]]
-        for busy_until, (count, balance_cost, batch_counts, plan) in normalized_states.items():
+        for busy_until, (count, plan) in normalized_states.items():
             for interpreter_id in candidate_ids:
                 slot = interpreter_index[interpreter_id]
                 if busy_until[slot] > appointment["starts_at"]:
@@ -495,13 +489,8 @@ def _optimal_batch_plan(
                 next_busy_list = list(busy_until)
                 next_busy_list[slot] = appointment["ends_at"]
                 next_busy = tuple(next_busy_list)
-                next_counts_list = list(batch_counts)
-                previous_load = load_by_id[interpreter_id] + next_counts_list[slot]
-                next_counts_list[slot] += 1
                 candidate_value = (
                     count + 1,
-                    balance_cost + (2 * previous_load) + 1,
-                    tuple(next_counts_list),
                     plan + ((appointment["id"], interpreter_id),),
                 )
                 if is_better(candidate_value, next_states.get(next_busy)):
@@ -512,7 +501,56 @@ def _optimal_batch_plan(
     for value in states.values():
         if is_better(value, best):
             best = value
-    return best[3] if best is not None else ()
+    initial_plan = best[1] if best is not None else ()
+    return _rebalance_batch_plan(db, appointments, initial_plan, load_by_id)
+
+
+def _rebalance_batch_plan(
+    db: sqlite3.Connection,
+    appointments: list[sqlite3.Row],
+    plan: tuple[tuple[int, int], ...],
+    historical_load: dict[int, int],
+) -> tuple[tuple[int, int], ...]:
+    assignments = dict(plan)
+    appointment_by_id = {appointment["id"]: appointment for appointment in appointments}
+    candidates_by_id = {
+        appointment["id"]: tuple(
+            candidate["id"] for candidate in _eligible_candidates(db, appointment)[0]
+        )
+        for appointment in appointments
+    }
+    batch_load = Counter(assignments.values())
+
+    changed = True
+    while changed:
+        changed = False
+        for appointment_id in sorted(assignments):
+            current_interpreter = assignments[appointment_id]
+            appointment = appointment_by_id[appointment_id]
+            for candidate_id in candidates_by_id[appointment_id]:
+                if candidate_id == current_interpreter:
+                    continue
+                has_conflict = any(
+                    other_id != appointment_id
+                    and other_interpreter == candidate_id
+                    and appointment_by_id[other_id]["starts_at"] < appointment["ends_at"]
+                    and appointment_by_id[other_id]["ends_at"] > appointment["starts_at"]
+                    for other_id, other_interpreter in assignments.items()
+                )
+                if has_conflict:
+                    continue
+                current_total = historical_load[current_interpreter] + batch_load[current_interpreter]
+                candidate_total = historical_load[candidate_id] + batch_load[candidate_id]
+                before = (current_total * current_total) + (candidate_total * candidate_total)
+                after = ((current_total - 1) ** 2) + ((candidate_total + 1) ** 2)
+                if after >= before:
+                    continue
+                assignments[appointment_id] = candidate_id
+                batch_load[current_interpreter] -= 1
+                batch_load[candidate_id] += 1
+                changed = True
+                break
+    return tuple((appointment_id, assignments[appointment_id]) for appointment_id, _ in plan)
 
 
 def schedule(db: sqlite3.Connection, appointment_id: int | None = None) -> dict:
@@ -583,11 +621,10 @@ def schedule(db: sqlite3.Connection, appointment_id: int | None = None) -> dict:
 def _mark_dispatched(
     db: sqlite3.Connection, confirmation_id: int, transport: str, output_path: str | None = None
 ) -> None:
-    with db:
-        db.execute(
-            "UPDATE confirmations SET dispatched_at = ?, output_path = ? WHERE id = ?",
-            (utc_now(), output_path or transport, confirmation_id),
-        )
+    db.execute(
+        "UPDATE confirmations SET dispatched_at = ?, output_path = ? WHERE id = ?",
+        (utc_now(), output_path or transport, confirmation_id),
+    )
 
 
 def dispatch_confirmations_via_sendmail(
@@ -600,38 +637,53 @@ def dispatch_confirmations_via_sendmail(
         raise ClinicError(f"sendmail executable does not exist: {sendmail_path}") from exc
     if not resolved_sendmail.is_file() or not os.access(resolved_sendmail, os.X_OK):
         raise ClinicError(f"sendmail path is not an executable file: {resolved_sendmail}")
-    clinic_now = datetime.now().strftime("%Y-%m-%dT%H:%M")
-    pending = db.execute(
-        "SELECT c.* FROM confirmations c "
-        "JOIN appointments a ON a.id = c.appointment_id "
-        "WHERE c.dispatched_at IS NULL AND a.status = 'scheduled' AND a.starts_at > ? "
-        "ORDER BY c.id",
-        (clinic_now,),
-    ).fetchall()
-    database_id_row = db.execute(
-        "SELECT value FROM settings WHERE key = 'database_id'"
-    ).fetchone()
-    if database_id_row is None:
-        database_id = uuid.uuid4().hex
-        with db:
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        database_id_row = db.execute(
+            "SELECT value FROM settings WHERE key = 'database_id'"
+        ).fetchone()
+        if database_id_row is None:
+            database_id = uuid.uuid4().hex
             db.execute(
                 "INSERT INTO settings(key, value) VALUES('database_id', ?)", (database_id,)
             )
-    else:
-        database_id = database_id_row["value"]
+        else:
+            database_id = database_id_row["value"]
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
     recipients: list[str] = []
-    for message in pending:
-        email = EmailMessage()
-        email["From"] = sender
-        email["To"] = message["recipient"]
-        email["Subject"] = message["subject"]
-        email["Date"] = format_datetime(datetime.fromisoformat(message["created_at"]))
-        email["Message-ID"] = (
-            f"<civic043-{database_id}-confirmation-{message['id']}@clinic.local>"
-        )
-        email.set_content(message["body"])
-        content = email.as_bytes(policy=SMTP)
+    while True:
+        db.execute("BEGIN IMMEDIATE")
         try:
+            clinic_now = datetime.now().strftime("%Y-%m-%dT%H:%M")
+            message = db.execute(
+                "SELECT c.* FROM confirmations c "
+                "JOIN appointments a ON a.id = c.appointment_id "
+                "WHERE c.dispatched_at IS NULL AND a.status = 'scheduled' AND a.starts_at > ? "
+                "ORDER BY c.id LIMIT 1",
+                (clinic_now,),
+            ).fetchone()
+            if message is None:
+                db.commit()
+                break
+        except Exception:
+            db.rollback()
+            raise
+
+        try:
+            email = EmailMessage()
+            email["From"] = sender
+            email["To"] = message["recipient"]
+            email["Subject"] = message["subject"]
+            email["Date"] = format_datetime(datetime.fromisoformat(message["created_at"]))
+            email["Message-ID"] = (
+                f"<civic043-{database_id}-confirmation-{message['id']}@clinic.local>"
+            )
+            email.set_content(message["body"])
+            content = email.as_bytes(policy=SMTP)
             result = subprocess.run(
                 [str(resolved_sendmail), "-i", "-f", sender, "--", message["recipient"]],
                 input=content,
@@ -640,14 +692,21 @@ def dispatch_confirmations_via_sendmail(
                 timeout=15,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            db.rollback()
             raise ClinicError(f"sendmail delivery failed for confirmation {message['id']}: {exc}") from exc
         if result.returncode != 0:
+            db.rollback()
             detail = result.stderr.decode("utf-8", errors="replace").strip()[:300]
             raise ClinicError(
                 f"sendmail rejected confirmation {message['id']} with exit {result.returncode}: {detail}"
             )
-        _mark_dispatched(db, message["id"], f"sendmail:{resolved_sendmail}")
+        try:
+            _mark_dispatched(db, message["id"], f"sendmail:{resolved_sendmail}")
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
         recipients.append(message["recipient"])
     return {"dispatched": len(recipients), "transport": "sendmail", "recipients": recipients}
 
@@ -655,51 +714,66 @@ def dispatch_confirmations_via_sendmail(
 def record_no_show(
     db: sqlite3.Connection, appointment_id: int, party: str, note: str
 ) -> dict:
-    appointment = db.execute(
-        "SELECT status, assigned_interpreter_id, starts_at FROM appointments WHERE id = ?",
-        (appointment_id,),
-    ).fetchone()
-    if appointment is None:
-        raise ClinicError(f"appointment {appointment_id} does not exist")
-    if appointment["status"] != "scheduled":
-        raise ClinicError(
-            f"no-show can only be recorded for scheduled appointments, found {appointment['status']}"
-        )
-    if parse_local_datetime(appointment["starts_at"], "stored start") > datetime.now():
-        raise ClinicError("no-show cannot be recorded before the appointment starts")
-    if party not in ("patient", "interpreter"):
-        raise ClinicError("party must be patient or interpreter")
-    if party == "interpreter" and appointment["assigned_interpreter_id"] is None:
-        raise ClinicError("an interpreter no-show requires an assigned interpreter")
-    status = f"{party}_no_show"
-    with db:
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        appointment = db.execute(
+            "SELECT status, assigned_interpreter_id, starts_at FROM appointments WHERE id = ?",
+            (appointment_id,),
+        ).fetchone()
+        if appointment is None:
+            raise ClinicError(f"appointment {appointment_id} does not exist")
+        if appointment["status"] != "scheduled":
+            raise ClinicError(
+                f"no-show can only be recorded for scheduled appointments, found {appointment['status']}"
+            )
+        if parse_local_datetime(appointment["starts_at"], "stored start") > datetime.now():
+            raise ClinicError("no-show cannot be recorded before the appointment starts")
+        if party not in ("patient", "interpreter"):
+            raise ClinicError("party must be patient or interpreter")
+        if party == "interpreter" and appointment["assigned_interpreter_id"] is None:
+            raise ClinicError("an interpreter no-show requires an assigned interpreter")
+        status = f"{party}_no_show"
         db.execute(
             "INSERT INTO no_show_events(appointment_id, party, note, recorded_at) VALUES(?, ?, ?, ?)",
             (appointment_id, party, note.strip(), utc_now()),
         )
-        db.execute("UPDATE appointments SET status = ? WHERE id = ?", (status, appointment_id))
+        cursor = db.execute(
+            "UPDATE appointments SET status = ? WHERE id = ? AND status = 'scheduled'",
+            (status, appointment_id),
+        )
+        if cursor.rowcount != 1:
+            raise ClinicError(f"appointment {appointment_id} changed while recording no-show")
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return {"appointment_id": appointment_id, "status": status, "party": party}
 
 
 def complete_appointment(db: sqlite3.Connection, appointment_id: int) -> dict:
-    appointment = db.execute(
-        "SELECT status, ends_at FROM appointments WHERE id = ?", (appointment_id,)
-    ).fetchone()
-    if appointment is None:
-        raise ClinicError(f"appointment {appointment_id} does not exist")
-    if appointment["status"] != "scheduled":
-        raise ClinicError(
-            f"appointment {appointment_id} cannot be completed from status {appointment['status']}"
-        )
-    if parse_local_datetime(appointment["ends_at"], "stored end") > datetime.now():
-        raise ClinicError("appointment cannot be completed before it ends")
-    with db:
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        appointment = db.execute(
+            "SELECT status, ends_at FROM appointments WHERE id = ?", (appointment_id,)
+        ).fetchone()
+        if appointment is None:
+            raise ClinicError(f"appointment {appointment_id} does not exist")
+        if appointment["status"] != "scheduled":
+            raise ClinicError(
+                f"appointment {appointment_id} cannot be completed from status {appointment['status']}"
+            )
+        if parse_local_datetime(appointment["ends_at"], "stored end") > datetime.now():
+            raise ClinicError("appointment cannot be completed before it ends")
         cursor = db.execute(
             "UPDATE appointments SET status = 'completed' WHERE id = ? AND status = 'scheduled'",
             (appointment_id,),
         )
-    if cursor.rowcount != 1:
-        raise ClinicError(f"appointment {appointment_id} changed while it was being completed")
+        if cursor.rowcount != 1:
+            raise ClinicError(f"appointment {appointment_id} changed while it was being completed")
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return {"appointment_id": appointment_id, "status": "completed"}
 
 

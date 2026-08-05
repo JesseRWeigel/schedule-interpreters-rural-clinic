@@ -72,6 +72,10 @@ the visit to have started, and completion requires its end time to have passed. 
 only sends confirmations before a visit starts while it is still scheduled. Pending messages
 remain in the database as audit evidence when an outcome makes them obsolete.
 
+SQLite write transactions serialize competing outcome updates. Confirmation workers claim and
+send one message per transaction, so concurrent dispatch commands cannot submit the same pending
+message twice.
+
 Confirmation messages and the SQLite database contain patient references and contact details. The
 tool creates the database with mode `0600`; the clinic's mail transfer agent is responsible for
 message storage and transport security. Store both systems in clinic-approved locations with
@@ -88,8 +92,11 @@ bash scripts/verify.sh
 ## Status
 
 ```text
+test_batch_balance_preserves_scarce_language_capacity (test_clinic.ClinicSchedulerTests.test_batch_balance_preserves_scarce_language_capacity) ... ok
 test_batch_plan_preserves_flexible_interpreter_for_mam (test_clinic.ClinicSchedulerTests.test_batch_plan_preserves_flexible_interpreter_for_mam) ... ok
 test_batch_tie_break_balances_new_assignments (test_clinic.ClinicSchedulerTests.test_batch_tie_break_balances_new_assignments) ... ok
+test_concurrent_dispatch_does_not_duplicate_messages (test_clinic.ClinicSchedulerTests.test_concurrent_dispatch_does_not_duplicate_messages) ... ok
+test_concurrent_outcomes_allow_one_final_state (test_clinic.ClinicSchedulerTests.test_concurrent_outcomes_allow_one_final_state) ... ok
 test_future_and_ongoing_outcomes_are_rejected (test_clinic.ClinicSchedulerTests.test_future_and_ongoing_outcomes_are_rejected) ... ok
 test_interpreter_no_show_is_not_delivered_access (test_clinic.ClinicSchedulerTests.test_interpreter_no_show_is_not_delivered_access) ... ok
 test_invalid_appointment_and_no_show_state_fail_closed (test_clinic.ClinicSchedulerTests.test_invalid_appointment_and_no_show_state_fail_closed) ... ok
@@ -102,13 +109,13 @@ test_sendmail_dispatch_and_monthly_report (test_clinic.ClinicSchedulerTests.test
 test_stale_confirmations_are_not_dispatched (test_clinic.ClinicSchedulerTests.test_stale_confirmations_are_not_dispatched) ... ok
 
 ----------------------------------------------------------------------
-Ran 12 tests in 4.658s
+Ran 15 tests in 3.250s
 
 OK
 WORKFLOW PASS: assignment, sendmail delivery, outcomes, secure database, and report
 SOURCE AUDIT PASS: 9 readable files, no sensitive literals
 README PASS: status and observed success line are present
-VERIFY PASS: 12 unit tests and full CLI workflow passed
+VERIFY PASS: 15 unit tests and full CLI workflow passed
 ```
 
 ## Unfinished

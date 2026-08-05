@@ -164,10 +164,10 @@ python3 scripts/audit_source.py
 
 test -f README.md
 grep -q '^## Status$' README.md
-grep -q '^VERIFY PASS: 12 unit tests and full CLI workflow passed$' README.md
+grep -q '^VERIFY PASS: 15 unit tests and full CLI workflow passed$' README.md
 if grep -q 'TODO' README.md; then
   echo "README CHECK FAIL: TODO remains" >&2
   exit 1
 fi
 echo "README PASS: status and observed success line are present"
-echo "VERIFY PASS: 12 unit tests and full CLI workflow passed"
+echo "VERIFY PASS: 15 unit tests and full CLI workflow passed"

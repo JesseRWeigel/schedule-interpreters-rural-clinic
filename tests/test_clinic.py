@@ -3,10 +3,12 @@ import os
 import stat
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
+from threading import Barrier
 
 from src.clinic import (
     ClinicError,
@@ -236,6 +238,33 @@ class ClinicSchedulerTests(unittest.TestCase):
         self.assertEqual(assignments.count(first), 2)
         self.assertEqual(assignments.count(second), 2)
 
+    def test_batch_balance_preserves_scarce_language_capacity(self):
+        flexible = self.add_interpreter(languages=("spanish", "mam"))
+        spanish_only = add_interpreter(
+            self.db,
+            "Interpreter Two",
+            "interpreter-2@clinic.test",
+            ("spanish",),
+            ("video",),
+        )["interpreter_id"]
+        add_availability(self.db, spanish_only, "monday", "08:00", "17:00")
+        spanish_visit = self.add_appointment(
+            start="2026-07-06T09:00", end="2026-07-06T10:00", patient_ref="PATIENT-001"
+        )
+        mam_visit = self.add_appointment(
+            language="mam",
+            start="2026-07-06T11:00",
+            end="2026-07-06T12:00",
+            patient_ref="PATIENT-002",
+        )
+
+        result = schedule(self.db)
+
+        assignments = {
+            row["appointment_id"]: row["interpreter_id"] for row in result["scheduled"]
+        }
+        self.assertEqual(assignments, {spanish_visit: spanish_only, mam_visit: flexible})
+
     def test_interpreter_no_show_is_not_delivered_access(self):
         self.add_interpreter()
         appointment_id = self.add_appointment()
@@ -374,6 +403,76 @@ class ClinicSchedulerTests(unittest.TestCase):
         ]
         self.assertEqual(len(messages), 4)
         self.assertEqual(len({message["Message-ID"] for message in messages}), 4)
+
+    def test_concurrent_dispatch_does_not_duplicate_messages(self):
+        self.add_interpreter()
+        self.add_appointment(start="2099-01-05T09:00", end="2099-01-05T10:00")
+        schedule(self.db)
+        mail_root = self.root / "concurrent-mailboxes"
+        barrier = Barrier(2)
+        previous = os.environ.get("CIVIC043_TEST_MAIL_ROOT")
+        os.environ["CIVIC043_TEST_MAIL_ROOT"] = str(mail_root)
+
+        def worker():
+            connection = connect(self.db_path)
+            try:
+                barrier.wait()
+                return dispatch_confirmations_via_sendmail(
+                    connection, self.sendmail, "clinic@clinic.test"
+                )["dispatched"]
+            finally:
+                connection.close()
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lambda _: worker(), range(2)))
+        finally:
+            if previous is None:
+                os.environ.pop("CIVIC043_TEST_MAIL_ROOT", None)
+            else:
+                os.environ["CIVIC043_TEST_MAIL_ROOT"] = previous
+
+        self.assertEqual(sum(results), 2)
+        self.assertEqual(len(list(mail_root.rglob("*.eml"))), 2)
+        dispatched = self.db.execute(
+            "SELECT COUNT(*) FROM confirmations WHERE dispatched_at IS NOT NULL"
+        ).fetchone()[0]
+        self.assertEqual(dispatched, 2)
+
+    def test_concurrent_outcomes_allow_one_final_state(self):
+        self.add_interpreter()
+        appointment_id = self.add_appointment(
+            start="2000-01-03T09:00", end="2000-01-03T10:00"
+        )
+        schedule(self.db)
+        barrier = Barrier(2)
+
+        def worker(action):
+            connection = connect(self.db_path)
+            try:
+                barrier.wait()
+                if action == "complete":
+                    complete_appointment(connection, appointment_id)
+                else:
+                    record_no_show(connection, appointment_id, "patient", "Concurrent outcome")
+                return action, None
+            except ClinicError as exc:
+                return action, str(exc)
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(worker, ("complete", "no_show")))
+
+        self.assertEqual(sum(error is None for _, error in results), 1)
+        final_status = self.db.execute(
+            "SELECT status FROM appointments WHERE id = ?", (appointment_id,)
+        ).fetchone()[0]
+        event_count = self.db.execute(
+            "SELECT COUNT(*) FROM no_show_events WHERE appointment_id = ?", (appointment_id,)
+        ).fetchone()[0]
+        self.assertIn(final_status, ("completed", "patient_no_show"))
+        self.assertEqual(event_count, 1 if final_status == "patient_no_show" else 0)
 
     def test_invalid_appointment_and_no_show_state_fail_closed(self):
         with self.assertRaises(ClinicError):
