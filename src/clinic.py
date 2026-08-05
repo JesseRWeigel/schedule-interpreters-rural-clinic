@@ -14,7 +14,6 @@ from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
 from email.policy import SMTP
 from email.utils import format_datetime, parseaddr
-from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -210,6 +209,10 @@ def init_database(db_path: Path, clinic_name: str) -> dict:
             "INSERT INTO settings(key, value) VALUES('clinic_name', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (clinic_name,),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('database_id', ?)",
+            (uuid.uuid4().hex,),
         )
         db.commit()
     finally:
@@ -445,39 +448,65 @@ def _optimal_batch_plan(
     interpreter_index = {
         interpreter_id: index for index, interpreter_id in enumerate(ordered_interpreters)
     }
+    empty_state = tuple("" for _ in ordered_interpreters)
+    states: dict[tuple[str, ...], tuple[int, int, tuple[tuple[int, int], ...]]] = {
+        empty_state: (0, 0, ())
+    }
 
-    @lru_cache(maxsize=None)
-    def solve(index: int, busy_until: tuple[str, ...]) -> tuple[int, tuple[tuple[int, int], ...]]:
-        if index == len(appointments):
-            return 0, ()
-        appointment = appointments[index]
-        normalized_busy = tuple(
-            end if end > appointment["starts_at"] else "" for end in busy_until
+    def is_better(
+        candidate: tuple[int, int, tuple[tuple[int, int], ...]],
+        current: tuple[int, int, tuple[tuple[int, int], ...]] | None,
+    ) -> bool:
+        if current is None:
+            return True
+        candidate_count, candidate_rank, candidate_plan = candidate
+        current_count, current_rank, current_plan = current
+        return (
+            candidate_count > current_count
+            or (
+                candidate_count == current_count
+                and (candidate_rank, candidate_plan) < (current_rank, current_plan)
+            )
         )
-        if normalized_busy != busy_until:
-            return solve(index, normalized_busy)
-        best_count = -1
-        best_plan: tuple[tuple[int, int], ...] = ()
 
-        for interpreter_id in candidates_by_appointment[appointment["id"]]:
-            slot = interpreter_index[interpreter_id]
-            if busy_until[slot] > appointment["starts_at"]:
-                continue
-            next_busy = list(busy_until)
-            next_busy[slot] = appointment["ends_at"]
-            later_count, later_plan = solve(index + 1, tuple(next_busy))
-            candidate_count = later_count + 1
-            if candidate_count > best_count:
-                best_count = candidate_count
-                best_plan = ((appointment["id"], interpreter_id),) + later_plan
+    for appointment in appointments:
+        normalized_states: dict[
+            tuple[str, ...], tuple[int, int, tuple[tuple[int, int], ...]]
+        ] = {}
+        for busy_until, value in states.items():
+            normalized_busy = tuple(
+                end if end > appointment["starts_at"] else "" for end in busy_until
+            )
+            if is_better(value, normalized_states.get(normalized_busy)):
+                normalized_states[normalized_busy] = value
 
-        skipped_count, skipped_plan = solve(index + 1, busy_until)
-        if skipped_count > best_count:
-            return skipped_count, skipped_plan
-        return best_count, best_plan
+        next_states = dict(normalized_states)
+        candidate_ids = candidates_by_appointment[appointment["id"]]
+        candidate_ranks = {
+            interpreter_id: rank for rank, interpreter_id in enumerate(candidate_ids)
+        }
+        for busy_until, (count, rank_cost, plan) in normalized_states.items():
+            for interpreter_id in candidate_ids:
+                slot = interpreter_index[interpreter_id]
+                if busy_until[slot] > appointment["starts_at"]:
+                    continue
+                next_busy_list = list(busy_until)
+                next_busy_list[slot] = appointment["ends_at"]
+                next_busy = tuple(next_busy_list)
+                candidate_value = (
+                    count + 1,
+                    rank_cost + candidate_ranks[interpreter_id],
+                    plan + ((appointment["id"], interpreter_id),),
+                )
+                if is_better(candidate_value, next_states.get(next_busy)):
+                    next_states[next_busy] = candidate_value
+        states = next_states
 
-    _, plan = solve(0, tuple("" for _ in ordered_interpreters))
-    return plan
+    best = None
+    for value in states.values():
+        if is_better(value, best):
+            best = value
+    return best[2] if best is not None else ()
 
 
 def schedule(db: sqlite3.Connection, appointment_id: int | None = None) -> dict:
@@ -567,11 +596,24 @@ def dispatch_confirmations_to_maildir(
     except OSError as exc:
         raise ClinicError(f"cannot secure Maildir: {exc}") from exc
     pending = db.execute(
-        "SELECT * FROM confirmations WHERE dispatched_at IS NULL ORDER BY id"
+        "SELECT c.* FROM confirmations c "
+        "JOIN appointments a ON a.id = c.appointment_id "
+        "WHERE c.dispatched_at IS NULL AND a.status = 'scheduled' ORDER BY c.id"
     ).fetchall()
+    database_id_row = db.execute(
+        "SELECT value FROM settings WHERE key = 'database_id'"
+    ).fetchone()
+    if database_id_row is None:
+        database_id = uuid.uuid4().hex
+        with db:
+            db.execute(
+                "INSERT INTO settings(key, value) VALUES('database_id', ?)", (database_id,)
+            )
+    else:
+        database_id = database_id_row["value"]
     written: list[str] = []
     for message in pending:
-        filename = f"civic043-confirmation-{message['id']}.eml"
+        filename = f"civic043-{database_id}-confirmation-{message['id']}.eml"
         target = maildir / "new" / filename
         temporary = maildir / "tmp" / f"{filename}.{os.getpid()}.{uuid.uuid4().hex}"
         email = EmailMessage()
@@ -579,7 +621,9 @@ def dispatch_confirmations_to_maildir(
         email["To"] = message["recipient"]
         email["Subject"] = message["subject"]
         email["Date"] = format_datetime(datetime.fromisoformat(message["created_at"]))
-        email["Message-ID"] = f"<civic043-confirmation-{message['id']}@clinic.local>"
+        email["Message-ID"] = (
+            f"<civic043-{database_id}-confirmation-{message['id']}@clinic.local>"
+        )
         email.set_content(message["body"])
         content = email.as_bytes(policy=SMTP)
         if target.exists():
@@ -616,7 +660,8 @@ def record_no_show(
     db: sqlite3.Connection, appointment_id: int, party: str, note: str
 ) -> dict:
     appointment = db.execute(
-        "SELECT status, assigned_interpreter_id FROM appointments WHERE id = ?", (appointment_id,)
+        "SELECT status, assigned_interpreter_id, starts_at FROM appointments WHERE id = ?",
+        (appointment_id,),
     ).fetchone()
     if appointment is None:
         raise ClinicError(f"appointment {appointment_id} does not exist")
@@ -624,6 +669,8 @@ def record_no_show(
         raise ClinicError(
             f"no-show can only be recorded for scheduled appointments, found {appointment['status']}"
         )
+    if parse_local_datetime(appointment["starts_at"], "stored start") > datetime.now():
+        raise ClinicError("no-show cannot be recorded before the appointment starts")
     if party not in ("patient", "interpreter"):
         raise ClinicError("party must be patient or interpreter")
     if party == "interpreter" and appointment["assigned_interpreter_id"] is None:
@@ -639,16 +686,24 @@ def record_no_show(
 
 
 def complete_appointment(db: sqlite3.Connection, appointment_id: int) -> dict:
+    appointment = db.execute(
+        "SELECT status, starts_at FROM appointments WHERE id = ?", (appointment_id,)
+    ).fetchone()
+    if appointment is None:
+        raise ClinicError(f"appointment {appointment_id} does not exist")
+    if appointment["status"] != "scheduled":
+        raise ClinicError(
+            f"appointment {appointment_id} cannot be completed from status {appointment['status']}"
+        )
+    if parse_local_datetime(appointment["starts_at"], "stored start") > datetime.now():
+        raise ClinicError("appointment cannot be completed before it starts")
     with db:
         cursor = db.execute(
             "UPDATE appointments SET status = 'completed' WHERE id = ? AND status = 'scheduled'",
             (appointment_id,),
         )
     if cursor.rowcount != 1:
-        row = db.execute("SELECT status FROM appointments WHERE id = ?", (appointment_id,)).fetchone()
-        if row is None:
-            raise ClinicError(f"appointment {appointment_id} does not exist")
-        raise ClinicError(f"appointment {appointment_id} cannot be completed from status {row['status']}")
+        raise ClinicError(f"appointment {appointment_id} changed while it was being completed")
     return {"appointment_id": appointment_id, "status": "completed"}
 
 

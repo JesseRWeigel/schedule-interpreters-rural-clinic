@@ -2,6 +2,7 @@ import csv
 import stat
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -11,6 +12,7 @@ from src.clinic import (
     add_appointment,
     add_availability,
     add_interpreter,
+    complete_appointment,
     connect,
     dispatch_confirmations_to_maildir,
     init_database,
@@ -214,6 +216,106 @@ class ClinicSchedulerTests(unittest.TestCase):
         self.assertEqual(overall["interpreter_no_shows"], "1")
         self.assertEqual(overall["delivered_access_visits"], "0")
         self.assertEqual(overall["delivered_access_rate_percent"], "0.0")
+
+    def test_large_adjacent_batch_does_not_recurse(self):
+        self.add_interpreter(start="00:00", end="23:59")
+        first_start = datetime(2026, 7, 6, 8, 0)
+        for index in range(600):
+            start = first_start + timedelta(minutes=index)
+            end = start + timedelta(minutes=1)
+            add_appointment(
+                self.db,
+                f"PATIENT-{index:03d}",
+                f"patient-{index:03d}@clinic.test",
+                "spanish",
+                "video",
+                start.strftime("%Y-%m-%dT%H:%M"),
+                end.strftime("%Y-%m-%dT%H:%M"),
+            )
+
+        result = schedule(self.db)
+
+        self.assertEqual(len(result["scheduled"]), 600)
+        self.assertEqual(result["unmatched"], [])
+
+    def test_future_outcomes_are_rejected(self):
+        future = datetime(2099, 1, 1, 9, 0)
+        future += timedelta(days=(7 - future.weekday()) % 7)
+        self.add_interpreter()
+        appointment_id = self.add_appointment(
+            start=future.strftime("%Y-%m-%dT%H:%M"),
+            end=(future + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M"),
+        )
+        schedule(self.db)
+
+        with self.assertRaises(ClinicError):
+            record_no_show(self.db, appointment_id, "patient", "")
+        with self.assertRaises(ClinicError):
+            complete_appointment(self.db, appointment_id)
+
+    def test_stale_confirmations_are_not_dispatched(self):
+        self.add_interpreter()
+        appointment_id = self.add_appointment(
+            start="2000-01-03T09:00", end="2000-01-03T10:00"
+        )
+        schedule(self.db)
+        record_no_show(self.db, appointment_id, "patient", "Visit did not occur")
+
+        maildir = self.root / "stale-maildir"
+        result = dispatch_confirmations_to_maildir(
+            self.db, maildir, "clinic@clinic.test"
+        )
+
+        self.assertEqual(result["dispatched"], 0)
+        self.assertEqual(list((maildir / "new").iterdir()), [])
+
+    def test_maildir_names_are_unique_across_databases(self):
+        self.add_interpreter()
+        self.add_appointment()
+        schedule(self.db)
+        maildir = self.root / "shared-maildir"
+        first = dispatch_confirmations_to_maildir(
+            self.db, maildir, "clinic@clinic.test"
+        )
+
+        second_path = self.root / "replacement.db"
+        init_database(second_path, "Replacement Rural Clinic")
+        second_db = connect(second_path)
+        try:
+            second_interpreter = add_interpreter(
+                second_db,
+                "Interpreter Two",
+                "interpreter-2@clinic.test",
+                ("spanish",),
+                ("video",),
+            )["interpreter_id"]
+            add_availability(second_db, second_interpreter, "monday", "08:00", "17:00")
+            add_appointment(
+                second_db,
+                "PATIENT-002",
+                "patient-002@clinic.test",
+                "spanish",
+                "video",
+                "2026-07-06T11:00",
+                "2026-07-06T12:00",
+            )
+            schedule(second_db)
+            second = dispatch_confirmations_to_maildir(
+                second_db, maildir, "clinic@clinic.test"
+            )
+            first_id = self.db.execute(
+                "SELECT value FROM settings WHERE key = 'database_id'"
+            ).fetchone()[0]
+            second_id = second_db.execute(
+                "SELECT value FROM settings WHERE key = 'database_id'"
+            ).fetchone()[0]
+        finally:
+            second_db.close()
+
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual(first["dispatched"], 2)
+        self.assertEqual(second["dispatched"], 2)
+        self.assertEqual(len(list((maildir / "new").iterdir())), 4)
 
     def test_invalid_appointment_and_no_show_state_fail_closed(self):
         with self.assertRaises(ClinicError):

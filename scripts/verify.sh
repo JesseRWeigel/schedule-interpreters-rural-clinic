@@ -38,12 +38,20 @@ python3 clinic_scheduler.py --db "$DB" add-appointment \
   --modality in-person \
   --start 2026-07-08T10:00 \
   --end 2026-07-08T11:00 >/dev/null
+python3 clinic_scheduler.py --db "$DB" add-appointment \
+  --patient-ref PATIENT-003 \
+  --patient-contact patient-003@clinic.test \
+  --language Spanish \
+  --modality video \
+  --start 2026-07-08T11:00 \
+  --end 2026-07-08T12:00 >/dev/null
 python3 clinic_scheduler.py --db "$DB" schedule >"$VERIFY_TMP/schedule.json"
+python3 clinic_scheduler.py --db "$DB" record-no-show \
+  --appointment 3 --party patient --note "Clinic follow-up required" >/dev/null
 python3 clinic_scheduler.py --db "$DB" dispatch-confirmations \
   --maildir "$MAILDIR" --sender clinic@clinic.test \
   >"$VERIFY_TMP/dispatch.json"
-python3 clinic_scheduler.py --db "$DB" record-no-show \
-  --appointment 1 --party patient --note "Clinic follow-up required" >/dev/null
+python3 clinic_scheduler.py --db "$DB" complete --appointment 1 >/dev/null
 python3 clinic_scheduler.py --db "$DB" monthly-report \
   --month 2026-07 --output "$REPORT" >/dev/null
 
@@ -62,7 +70,7 @@ maildir = Path(maildir_text)
 report_path = Path(report_text)
 schedule_result = json.loads(Path(schedule_text).read_text(encoding="utf-8"))
 
-assert [row["appointment_id"] for row in schedule_result["scheduled"]] == [1]
+assert [row["appointment_id"] for row in schedule_result["scheduled"]] == [1, 3]
 assert [row["appointment_id"] for row in schedule_result["unmatched"]] == [2]
 assert schedule_result["unmatched"][0]["failed_language"] == 1
 
@@ -70,16 +78,23 @@ db = sqlite3.connect(db_path)
 appointments = db.execute(
     "SELECT id, status, assigned_interpreter_id FROM appointments ORDER BY id"
 ).fetchall()
-assert appointments == [(1, "patient_no_show", 1), (2, "requested", None)]
-assert db.execute("SELECT COUNT(*) FROM confirmations").fetchone()[0] == 2
+assert appointments == [
+    (1, "completed", 1),
+    (2, "requested", None),
+    (3, "patient_no_show", 1),
+]
+assert db.execute("SELECT COUNT(*) FROM confirmations").fetchone()[0] == 4
 assert db.execute(
     "SELECT COUNT(*) FROM confirmations WHERE dispatched_at IS NOT NULL"
+).fetchone()[0] == 2
+assert db.execute(
+    "SELECT COUNT(*) FROM confirmations WHERE dispatched_at IS NULL AND appointment_id = 3"
 ).fetchone()[0] == 2
 assert db.execute(
     "SELECT COUNT(*) FROM confirmations WHERE output_path LIKE '%/new/%'"
 ).fetchone()[0] == 2
 assert db.execute(
-    "SELECT party FROM no_show_events WHERE appointment_id = 1"
+    "SELECT party FROM no_show_events WHERE appointment_id = 3"
 ).fetchone()[0] == "patient"
 db.close()
 assert stat.S_IMODE(Path(db_path).stat().st_mode) == 0o600
@@ -101,13 +116,14 @@ with report_path.open(newline="", encoding="utf-8") as handle:
 assert [row["language"] for row in report_rows] == ["ALL", "mam", "spanish"]
 overall = report_rows[0]
 assert overall["clinic_name"] == "Valley Rural Clinic"
-assert overall["requested_visits"] == "2"
-assert overall["assigned_visits"] == "1"
+assert overall["requested_visits"] == "3"
+assert overall["assigned_visits"] == "2"
+assert overall["completed_visits"] == "1"
 assert overall["patient_no_shows"] == "1"
 assert overall["unmatched_visits"] == "1"
-assert overall["assignment_rate_percent"] == "50.0"
-assert overall["delivered_access_visits"] == "0"
-assert overall["delivered_access_rate_percent"] == "0.0"
+assert overall["assignment_rate_percent"] == "66.7"
+assert overall["delivered_access_visits"] == "1"
+assert overall["delivered_access_rate_percent"] == "33.3"
 print("WORKFLOW PASS: assignment, Maildir delivery, no-show, secure database, and report")
 PY
 
@@ -115,10 +131,10 @@ python3 scripts/audit_source.py
 
 test -f README.md
 grep -q '^## Status$' README.md
-grep -q '^VERIFY PASS: 7 unit tests and full CLI workflow passed$' README.md
+grep -q '^VERIFY PASS: 11 unit tests and full CLI workflow passed$' README.md
 if grep -q 'TODO' README.md; then
   echo "README CHECK FAIL: TODO remains" >&2
   exit 1
 fi
 echo "README PASS: status and observed success line are present"
-echo "VERIFY PASS: 7 unit tests and full CLI workflow passed"
+echo "VERIFY PASS: 11 unit tests and full CLI workflow passed"
