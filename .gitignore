@@ -15,5 +15,5 @@ build/
 *.db
 *.db-shm
 *.db-wal
-maildir/
+recipient-mailboxes/
 reports/

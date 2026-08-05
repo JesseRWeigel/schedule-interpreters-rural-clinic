@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import os
+import subprocess
 import sqlite3
 import sys
 import uuid
@@ -449,29 +450,33 @@ def _optimal_batch_plan(
         interpreter_id: index for index, interpreter_id in enumerate(ordered_interpreters)
     }
     empty_state = tuple("" for _ in ordered_interpreters)
-    states: dict[tuple[str, ...], tuple[int, int, tuple[tuple[int, int], ...]]] = {
-        empty_state: (0, 0, ())
+    empty_counts = tuple(0 for _ in ordered_interpreters)
+    states: dict[
+        tuple[str, ...], tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]]
+    ] = {
+        empty_state: (0, 0, empty_counts, ())
     }
 
     def is_better(
-        candidate: tuple[int, int, tuple[tuple[int, int], ...]],
-        current: tuple[int, int, tuple[tuple[int, int], ...]] | None,
+        candidate: tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]],
+        current: tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]] | None,
     ) -> bool:
         if current is None:
             return True
-        candidate_count, candidate_rank, candidate_plan = candidate
-        current_count, current_rank, current_plan = current
+        candidate_count, candidate_cost, _, candidate_plan = candidate
+        current_count, current_cost, _, current_plan = current
         return (
             candidate_count > current_count
             or (
                 candidate_count == current_count
-                and (candidate_rank, candidate_plan) < (current_rank, current_plan)
+                and (candidate_cost, candidate_plan) < (current_cost, current_plan)
             )
         )
 
     for appointment in appointments:
         normalized_states: dict[
-            tuple[str, ...], tuple[int, int, tuple[tuple[int, int], ...]]
+            tuple[str, ...],
+            tuple[int, int, tuple[int, ...], tuple[tuple[int, int], ...]],
         ] = {}
         for busy_until, value in states.items():
             normalized_busy = tuple(
@@ -482,10 +487,7 @@ def _optimal_batch_plan(
 
         next_states = dict(normalized_states)
         candidate_ids = candidates_by_appointment[appointment["id"]]
-        candidate_ranks = {
-            interpreter_id: rank for rank, interpreter_id in enumerate(candidate_ids)
-        }
-        for busy_until, (count, rank_cost, plan) in normalized_states.items():
+        for busy_until, (count, balance_cost, batch_counts, plan) in normalized_states.items():
             for interpreter_id in candidate_ids:
                 slot = interpreter_index[interpreter_id]
                 if busy_until[slot] > appointment["starts_at"]:
@@ -493,9 +495,13 @@ def _optimal_batch_plan(
                 next_busy_list = list(busy_until)
                 next_busy_list[slot] = appointment["ends_at"]
                 next_busy = tuple(next_busy_list)
+                next_counts_list = list(batch_counts)
+                previous_load = load_by_id[interpreter_id] + next_counts_list[slot]
+                next_counts_list[slot] += 1
                 candidate_value = (
                     count + 1,
-                    rank_cost + candidate_ranks[interpreter_id],
+                    balance_cost + (2 * previous_load) + 1,
+                    tuple(next_counts_list),
                     plan + ((appointment["id"], interpreter_id),),
                 )
                 if is_better(candidate_value, next_states.get(next_busy)):
@@ -506,7 +512,7 @@ def _optimal_batch_plan(
     for value in states.values():
         if is_better(value, best):
             best = value
-    return best[2] if best is not None else ()
+    return best[3] if best is not None else ()
 
 
 def schedule(db: sqlite3.Connection, appointment_id: int | None = None) -> dict:
@@ -584,21 +590,23 @@ def _mark_dispatched(
         )
 
 
-def dispatch_confirmations_to_maildir(
-    db: sqlite3.Connection, maildir: Path, sender: str
+def dispatch_confirmations_via_sendmail(
+    db: sqlite3.Connection, sendmail_path: Path, sender: str
 ) -> dict:
     sender = normalize_email(sender, "sender")
-    directories = [maildir, maildir / "tmp", maildir / "new", maildir / "cur"]
     try:
-        for directory in directories:
-            directory.mkdir(parents=True, exist_ok=True)
-            directory.chmod(0o700)
+        resolved_sendmail = sendmail_path.resolve(strict=True)
     except OSError as exc:
-        raise ClinicError(f"cannot secure Maildir: {exc}") from exc
+        raise ClinicError(f"sendmail executable does not exist: {sendmail_path}") from exc
+    if not resolved_sendmail.is_file() or not os.access(resolved_sendmail, os.X_OK):
+        raise ClinicError(f"sendmail path is not an executable file: {resolved_sendmail}")
+    clinic_now = datetime.now().strftime("%Y-%m-%dT%H:%M")
     pending = db.execute(
         "SELECT c.* FROM confirmations c "
         "JOIN appointments a ON a.id = c.appointment_id "
-        "WHERE c.dispatched_at IS NULL AND a.status = 'scheduled' ORDER BY c.id"
+        "WHERE c.dispatched_at IS NULL AND a.status = 'scheduled' AND a.starts_at > ? "
+        "ORDER BY c.id",
+        (clinic_now,),
     ).fetchall()
     database_id_row = db.execute(
         "SELECT value FROM settings WHERE key = 'database_id'"
@@ -611,11 +619,8 @@ def dispatch_confirmations_to_maildir(
             )
     else:
         database_id = database_id_row["value"]
-    written: list[str] = []
+    recipients: list[str] = []
     for message in pending:
-        filename = f"civic043-{database_id}-confirmation-{message['id']}.eml"
-        target = maildir / "new" / filename
-        temporary = maildir / "tmp" / f"{filename}.{os.getpid()}.{uuid.uuid4().hex}"
         email = EmailMessage()
         email["From"] = sender
         email["To"] = message["recipient"]
@@ -626,34 +631,25 @@ def dispatch_confirmations_to_maildir(
         )
         email.set_content(message["body"])
         content = email.as_bytes(policy=SMTP)
-        if target.exists():
-            try:
-                if target.read_bytes() != content:
-                    raise ClinicError(
-                        f"Maildir already contains different content for confirmation {message['id']}"
-                    )
-            except OSError as exc:
-                raise ClinicError(f"could not inspect confirmation {message['id']}: {exc}") from exc
-            _mark_dispatched(db, message["id"], "maildir", str(target.resolve()))
-            written.append(str(target))
-            continue
         try:
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, target)
-            target.chmod(0o600)
-        except OSError as exc:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise ClinicError(f"could not dispatch confirmation {message['id']}: {exc}") from exc
-        _mark_dispatched(db, message["id"], "maildir", str(target.resolve()))
-        written.append(str(target))
-    return {"dispatched": len(written), "transport": "maildir", "files": written}
+            result = subprocess.run(
+                [str(resolved_sendmail), "-i", "-f", sender, "--", message["recipient"]],
+                input=content,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ClinicError(f"sendmail delivery failed for confirmation {message['id']}: {exc}") from exc
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()[:300]
+            raise ClinicError(
+                f"sendmail rejected confirmation {message['id']} with exit {result.returncode}: {detail}"
+            )
+        _mark_dispatched(db, message["id"], f"sendmail:{resolved_sendmail}")
+        recipients.append(message["recipient"])
+    return {"dispatched": len(recipients), "transport": "sendmail", "recipients": recipients}
 
 
 def record_no_show(
@@ -687,7 +683,7 @@ def record_no_show(
 
 def complete_appointment(db: sqlite3.Connection, appointment_id: int) -> dict:
     appointment = db.execute(
-        "SELECT status, starts_at FROM appointments WHERE id = ?", (appointment_id,)
+        "SELECT status, ends_at FROM appointments WHERE id = ?", (appointment_id,)
     ).fetchone()
     if appointment is None:
         raise ClinicError(f"appointment {appointment_id} does not exist")
@@ -695,8 +691,8 @@ def complete_appointment(db: sqlite3.Connection, appointment_id: int) -> dict:
         raise ClinicError(
             f"appointment {appointment_id} cannot be completed from status {appointment['status']}"
         )
-    if parse_local_datetime(appointment["starts_at"], "stored start") > datetime.now():
-        raise ClinicError("appointment cannot be completed before it starts")
+    if parse_local_datetime(appointment["ends_at"], "stored end") > datetime.now():
+        raise ClinicError("appointment cannot be completed before it ends")
     with db:
         cursor = db.execute(
             "UPDATE appointments SET status = 'completed' WHERE id = ? AND status = 'scheduled'",
@@ -831,9 +827,9 @@ def build_parser() -> argparse.ArgumentParser:
     schedule_command.add_argument("--appointment", type=int)
 
     dispatch = commands.add_parser(
-        "dispatch-confirmations", help="deliver pending email confirmations to a Maildir"
+        "dispatch-confirmations", help="send pending confirmations through a local mail transfer agent"
     )
-    dispatch.add_argument("--maildir", type=Path, required=True)
+    dispatch.add_argument("--sendmail", type=Path, required=True)
     dispatch.add_argument("--sender", required=True)
 
     no_show = commands.add_parser("record-no-show", help="record a patient or interpreter no-show")
@@ -874,7 +870,7 @@ def run_command(args: argparse.Namespace) -> object:
         if args.command == "schedule":
             return schedule(db, args.appointment)
         if args.command == "dispatch-confirmations":
-            return dispatch_confirmations_to_maildir(db, args.maildir, args.sender)
+            return dispatch_confirmations_via_sendmail(db, args.sendmail, args.sender)
         if args.command == "record-no-show":
             return record_no_show(db, args.appointment, args.party, args.note)
         if args.command == "complete":

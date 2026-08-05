@@ -1,4 +1,5 @@
 import csv
+import os
 import stat
 import tempfile
 import unittest
@@ -14,7 +15,7 @@ from src.clinic import (
     add_interpreter,
     complete_appointment,
     connect,
-    dispatch_confirmations_to_maildir,
+    dispatch_confirmations_via_sendmail,
     init_database,
     monthly_report,
     record_no_show,
@@ -30,6 +31,7 @@ class ClinicSchedulerTests(unittest.TestCase):
         init_database(self.db_path, "Test Rural Clinic")
         self.assertEqual(stat.S_IMODE(self.db_path.stat().st_mode), 0o600)
         self.db = connect(self.db_path)
+        self.sendmail = Path(__file__).with_name("sendmail_receiver.py")
 
     def tearDown(self):
         self.db.close()
@@ -69,6 +71,19 @@ class ClinicSchedulerTests(unittest.TestCase):
             start,
             end,
         )["appointment_id"]
+
+    def dispatch(self, db, mail_root):
+        previous = os.environ.get("CIVIC043_TEST_MAIL_ROOT")
+        os.environ["CIVIC043_TEST_MAIL_ROOT"] = str(mail_root)
+        try:
+            return dispatch_confirmations_via_sendmail(
+                db, self.sendmail, "clinic@clinic.test"
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("CIVIC043_TEST_MAIL_ROOT", None)
+            else:
+                os.environ["CIVIC043_TEST_MAIL_ROOT"] = previous
 
     def test_matches_language_case_modality_and_availability(self):
         interpreter_id = self.add_interpreter(languages=("  Spanish ", "mam"))
@@ -134,39 +149,35 @@ class ClinicSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(remaining_result["unmatched"][0]["failed_conflict"], 1)
 
-    def test_dispatch_no_show_and_monthly_report(self):
+    def test_sendmail_dispatch_and_monthly_report(self):
         self.add_interpreter()
-        assigned = self.add_appointment()
+        assigned = self.add_appointment(
+            start="2099-01-05T09:00", end="2099-01-05T10:00"
+        )
         unmatched = self.add_appointment(
-            language="mam", patient_ref="PATIENT-002", start="2026-07-06T11:00", end="2026-07-06T12:00"
+            language="mam",
+            patient_ref="PATIENT-002",
+            start="2099-01-05T11:00",
+            end="2099-01-05T12:00",
         )
         schedule_result = schedule(self.db)
         self.assertEqual([item["appointment_id"] for item in schedule_result["scheduled"]], [assigned])
         self.assertEqual([item["appointment_id"] for item in schedule_result["unmatched"]], [unmatched])
 
-        maildir = self.root / "maildir"
-        dispatch = dispatch_confirmations_to_maildir(
-            self.db, maildir, "clinic@clinic.test"
-        )
+        mail_root = self.root / "recipient-mailboxes"
+        dispatch = self.dispatch(self.db, mail_root)
         self.assertEqual(dispatch["dispatched"], 2)
-        self.assertEqual(
-            dispatch_confirmations_to_maildir(
-                self.db, maildir, "clinic@clinic.test"
-            )["dispatched"],
-            0,
-        )
-        self.assertEqual(stat.S_IMODE(maildir.stat().st_mode), 0o700)
-        for path_text in dispatch["files"]:
-            path = Path(path_text)
+        self.assertEqual(self.dispatch(self.db, mail_root)["dispatched"], 0)
+        messages = list(mail_root.rglob("*.eml"))
+        self.assertEqual(len(messages), 2)
+        for path in messages:
             message = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
             self.assertEqual(message["From"], "clinic@clinic.test")
             self.assertIn("@clinic.test", message["To"])
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
-        event = record_no_show(self.db, assigned, "patient", "Clinic follow-up required")
-        self.assertEqual(event["status"], "patient_no_show")
         report_path = self.root / "title-vi.csv"
-        report = monthly_report(self.db, "2026-07", report_path)
+        report = monthly_report(self.db, "2099-01", report_path)
         self.assertEqual(report["appointments"], 2)
         with report_path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
@@ -174,7 +185,7 @@ class ClinicSchedulerTests(unittest.TestCase):
         self.assertEqual(overall["scope"], "all")
         self.assertEqual(overall["requested_visits"], "2")
         self.assertEqual(overall["assigned_visits"], "1")
-        self.assertEqual(overall["patient_no_shows"], "1")
+        self.assertEqual(overall["patient_no_shows"], "0")
         self.assertEqual(overall["unmatched_visits"], "1")
         self.assertEqual(overall["assignment_rate_percent"], "50.0")
         self.assertEqual(overall["delivered_access_visits"], "0")
@@ -200,6 +211,30 @@ class ClinicSchedulerTests(unittest.TestCase):
         }
         self.assertEqual(assignments, {spanish_visit: spanish_only, mam_visit: flexible})
         self.assertEqual(result["unmatched"], [])
+
+    def test_batch_tie_break_balances_new_assignments(self):
+        first = self.add_interpreter()
+        second = add_interpreter(
+            self.db,
+            "Interpreter Two",
+            "interpreter-2@clinic.test",
+            ("spanish",),
+            ("video",),
+        )["interpreter_id"]
+        add_availability(self.db, second, "monday", "08:00", "17:00")
+        for index in range(4):
+            start = datetime(2026, 7, 6, 9 + index, 0)
+            self.add_appointment(
+                start=start.strftime("%Y-%m-%dT%H:%M"),
+                end=(start + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M"),
+                patient_ref=f"PATIENT-{index:03d}",
+            )
+
+        result = schedule(self.db)
+
+        assignments = [row["interpreter_id"] for row in result["scheduled"]]
+        self.assertEqual(assignments.count(first), 2)
+        self.assertEqual(assignments.count(second), 2)
 
     def test_interpreter_no_show_is_not_delivered_access(self):
         self.add_interpreter()
@@ -238,7 +273,7 @@ class ClinicSchedulerTests(unittest.TestCase):
         self.assertEqual(len(result["scheduled"]), 600)
         self.assertEqual(result["unmatched"], [])
 
-    def test_future_outcomes_are_rejected(self):
+    def test_future_and_ongoing_outcomes_are_rejected(self):
         future = datetime(2099, 1, 1, 9, 0)
         future += timedelta(days=(7 - future.weekday()) % 7)
         self.add_interpreter()
@@ -253,6 +288,30 @@ class ClinicSchedulerTests(unittest.TestCase):
         with self.assertRaises(ClinicError):
             complete_appointment(self.db, appointment_id)
 
+        now = datetime.now().replace(second=0, microsecond=0)
+        current_interpreter = add_interpreter(
+            self.db,
+            "Interpreter Current",
+            "interpreter-current@clinic.test",
+            ("spanish",),
+            ("video",),
+        )["interpreter_id"]
+        add_availability(
+            self.db,
+            current_interpreter,
+            now.strftime("%A"),
+            "00:00",
+            "23:59",
+        )
+        ongoing = self.add_appointment(
+            start=(now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M"),
+            end=(now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M"),
+            patient_ref="PATIENT-ONGOING",
+        )
+        schedule(self.db, ongoing)
+        with self.assertRaises(ClinicError):
+            complete_appointment(self.db, ongoing)
+
     def test_stale_confirmations_are_not_dispatched(self):
         self.add_interpreter()
         appointment_id = self.add_appointment(
@@ -261,22 +320,18 @@ class ClinicSchedulerTests(unittest.TestCase):
         schedule(self.db)
         record_no_show(self.db, appointment_id, "patient", "Visit did not occur")
 
-        maildir = self.root / "stale-maildir"
-        result = dispatch_confirmations_to_maildir(
-            self.db, maildir, "clinic@clinic.test"
-        )
+        mail_root = self.root / "stale-mailboxes"
+        result = self.dispatch(self.db, mail_root)
 
         self.assertEqual(result["dispatched"], 0)
-        self.assertEqual(list((maildir / "new").iterdir()), [])
+        self.assertEqual(list(mail_root.rglob("*.eml")), [])
 
-    def test_maildir_names_are_unique_across_databases(self):
+    def test_message_ids_are_unique_across_databases(self):
         self.add_interpreter()
-        self.add_appointment()
+        self.add_appointment(start="2099-01-05T09:00", end="2099-01-05T10:00")
         schedule(self.db)
-        maildir = self.root / "shared-maildir"
-        first = dispatch_confirmations_to_maildir(
-            self.db, maildir, "clinic@clinic.test"
-        )
+        mail_root = self.root / "shared-mailboxes"
+        first = self.dispatch(self.db, mail_root)
 
         second_path = self.root / "replacement.db"
         init_database(second_path, "Replacement Rural Clinic")
@@ -296,13 +351,11 @@ class ClinicSchedulerTests(unittest.TestCase):
                 "patient-002@clinic.test",
                 "spanish",
                 "video",
-                "2026-07-06T11:00",
-                "2026-07-06T12:00",
+                "2099-01-05T11:00",
+                "2099-01-05T12:00",
             )
             schedule(second_db)
-            second = dispatch_confirmations_to_maildir(
-                second_db, maildir, "clinic@clinic.test"
-            )
+            second = self.dispatch(second_db, mail_root)
             first_id = self.db.execute(
                 "SELECT value FROM settings WHERE key = 'database_id'"
             ).fetchone()[0]
@@ -315,7 +368,12 @@ class ClinicSchedulerTests(unittest.TestCase):
         self.assertNotEqual(first_id, second_id)
         self.assertEqual(first["dispatched"], 2)
         self.assertEqual(second["dispatched"], 2)
-        self.assertEqual(len(list((maildir / "new").iterdir())), 4)
+        messages = [
+            BytesParser(policy=policy.default).parsebytes(path.read_bytes())
+            for path in mail_root.rglob("*.eml")
+        ]
+        self.assertEqual(len(messages), 4)
+        self.assertEqual(len({message["Message-ID"] for message in messages}), 4)
 
     def test_invalid_appointment_and_no_show_state_fail_closed(self):
         with self.assertRaises(ClinicError):
