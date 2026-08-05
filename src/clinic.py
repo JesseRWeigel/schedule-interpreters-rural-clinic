@@ -8,8 +8,13 @@ import json
 import os
 import sqlite3
 import sys
+import uuid
 from collections import Counter, defaultdict
 from datetime import date, datetime, time, timezone
+from email.message import EmailMessage
+from email.policy import SMTP
+from email.utils import format_datetime, parseaddr
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -137,6 +142,17 @@ def normalize_language(value: str) -> str:
     return normalize_text(value, "language").casefold()
 
 
+def normalize_email(value: str, label: str) -> str:
+    cleaned = normalize_text(value, label)
+    display_name, address = parseaddr(cleaned)
+    if display_name or address != cleaned or address.count("@") != 1:
+        raise ClinicError(f"{label} must be a plain email address")
+    local_part, domain = address.rsplit("@", 1)
+    if not local_part or "." not in domain or domain.startswith(".") or domain.endswith("."):
+        raise ClinicError(f"{label} must be a plain email address")
+    return address
+
+
 def parse_local_datetime(value: str, label: str) -> datetime:
     try:
         parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M")
@@ -198,6 +214,10 @@ def init_database(db_path: Path, clinic_name: str) -> dict:
         db.commit()
     finally:
         db.close()
+    try:
+        db_path.chmod(0o600)
+    except OSError as exc:
+        raise ClinicError(f"cannot secure database file: {exc}") from exc
     return {"database": str(db_path), "clinic_name": clinic_name, "initialized": True}
 
 
@@ -209,7 +229,7 @@ def add_interpreter(
     modalities: Iterable[str],
 ) -> dict:
     name = normalize_text(name, "interpreter name")
-    contact = normalize_text(contact, "interpreter contact")
+    contact = normalize_email(contact, "interpreter contact")
     language_set = sorted({normalize_language(value) for value in languages})
     modality_set = sorted(set(modalities))
     if not language_set:
@@ -289,7 +309,7 @@ def add_appointment(
     ends_at: str,
 ) -> dict:
     patient_ref = normalize_text(patient_ref, "patient reference")
-    patient_contact = normalize_text(patient_contact, "patient contact")
+    patient_contact = normalize_email(patient_contact, "patient contact")
     language = normalize_language(language)
     if modality not in MODALITIES:
         raise ClinicError(f"unsupported modality: {modality}")
@@ -398,6 +418,68 @@ def _confirmation_messages(
     ]
 
 
+def _optimal_batch_plan(
+    db: sqlite3.Connection, appointments: list[sqlite3.Row]
+) -> tuple[tuple[int, int], ...]:
+    """Maximize assignments while respecting candidate eligibility and batch conflicts."""
+    candidates_by_appointment: dict[int, tuple[int, ...]] = {}
+    interpreter_ids: set[int] = set()
+    load_by_id: dict[int, int] = {}
+    for appointment in appointments:
+        candidates, _ = _eligible_candidates(db, appointment)
+        for candidate in candidates:
+            interpreter_id = candidate["id"]
+            interpreter_ids.add(interpreter_id)
+            if interpreter_id not in load_by_id:
+                load_by_id[interpreter_id] = db.execute(
+                    "SELECT COUNT(*) AS count FROM appointments "
+                    "WHERE assigned_interpreter_id = ? AND status != 'cancelled'",
+                    (interpreter_id,),
+                ).fetchone()["count"]
+        candidates_by_appointment[appointment["id"]] = tuple(
+            candidate["id"]
+            for candidate in sorted(candidates, key=lambda item: (load_by_id[item["id"]], item["id"]))
+        )
+
+    ordered_interpreters = tuple(sorted(interpreter_ids))
+    interpreter_index = {
+        interpreter_id: index for index, interpreter_id in enumerate(ordered_interpreters)
+    }
+
+    @lru_cache(maxsize=None)
+    def solve(index: int, busy_until: tuple[str, ...]) -> tuple[int, tuple[tuple[int, int], ...]]:
+        if index == len(appointments):
+            return 0, ()
+        appointment = appointments[index]
+        normalized_busy = tuple(
+            end if end > appointment["starts_at"] else "" for end in busy_until
+        )
+        if normalized_busy != busy_until:
+            return solve(index, normalized_busy)
+        best_count = -1
+        best_plan: tuple[tuple[int, int], ...] = ()
+
+        for interpreter_id in candidates_by_appointment[appointment["id"]]:
+            slot = interpreter_index[interpreter_id]
+            if busy_until[slot] > appointment["starts_at"]:
+                continue
+            next_busy = list(busy_until)
+            next_busy[slot] = appointment["ends_at"]
+            later_count, later_plan = solve(index + 1, tuple(next_busy))
+            candidate_count = later_count + 1
+            if candidate_count > best_count:
+                best_count = candidate_count
+                best_plan = ((appointment["id"], interpreter_id),) + later_plan
+
+        skipped_count, skipped_plan = solve(index + 1, busy_until)
+        if skipped_count > best_count:
+            return skipped_count, skipped_plan
+        return best_count, best_plan
+
+    _, plan = solve(0, tuple("" for _ in ordered_interpreters))
+    return plan
+
+
 def schedule(db: sqlite3.Connection, appointment_id: int | None = None) -> dict:
     db.execute("BEGIN IMMEDIATE")
     try:
@@ -420,22 +502,15 @@ def schedule(db: sqlite3.Connection, appointment_id: int | None = None) -> dict:
         clinic_name = db.execute(
             "SELECT value FROM settings WHERE key = 'clinic_name'"
         ).fetchone()["value"]
+        plan = dict(_optimal_batch_plan(db, appointments))
         scheduled: list[dict] = []
-        unmatched: list[dict] = []
         for appointment in appointments:
-            candidates, diagnostics = _eligible_candidates(db, appointment)
-            if not candidates:
-                unmatched.append({"appointment_id": appointment["id"], **diagnostics})
+            interpreter_id = plan.get(appointment["id"])
+            if interpreter_id is None:
                 continue
-            load_by_id = {
-                candidate["id"]: db.execute(
-                    "SELECT COUNT(*) AS count FROM appointments "
-                    "WHERE assigned_interpreter_id = ? AND status != 'cancelled'",
-                    (candidate["id"],),
-                ).fetchone()["count"]
-                for candidate in candidates
-            }
-            interpreter = min(candidates, key=lambda item: (load_by_id[item["id"]], item["id"]))
+            interpreter = db.execute(
+                "SELECT id, name, contact FROM interpreters WHERE id = ?", (interpreter_id,)
+            ).fetchone()
             timestamp = utc_now()
             db.execute(
                 "UPDATE appointments SET status = 'scheduled', assigned_interpreter_id = ?, "
@@ -457,6 +532,12 @@ def schedule(db: sqlite3.Connection, appointment_id: int | None = None) -> dict:
                     "interpreter": interpreter["name"],
                 }
             )
+        unmatched: list[dict] = []
+        for appointment in appointments:
+            if appointment["id"] in plan:
+                continue
+            _, diagnostics = _eligible_candidates(db, appointment)
+            unmatched.append({"appointment_id": appointment["id"], **diagnostics})
         db.commit()
     except Exception:
         db.rollback()
@@ -464,27 +545,57 @@ def schedule(db: sqlite3.Connection, appointment_id: int | None = None) -> dict:
     return {"scheduled": scheduled, "unmatched": unmatched}
 
 
-def dispatch_confirmations(db: sqlite3.Connection, outbox: Path) -> dict:
-    outbox.mkdir(parents=True, exist_ok=True)
+def _mark_dispatched(
+    db: sqlite3.Connection, confirmation_id: int, transport: str, output_path: str | None = None
+) -> None:
+    with db:
+        db.execute(
+            "UPDATE confirmations SET dispatched_at = ?, output_path = ? WHERE id = ?",
+            (utc_now(), output_path or transport, confirmation_id),
+        )
+
+
+def dispatch_confirmations_to_maildir(
+    db: sqlite3.Connection, maildir: Path, sender: str
+) -> dict:
+    sender = normalize_email(sender, "sender")
+    directories = [maildir, maildir / "tmp", maildir / "new", maildir / "cur"]
     try:
-        outbox.chmod(0o700)
+        for directory in directories:
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o700)
     except OSError as exc:
-        raise ClinicError(f"cannot secure outbox directory: {exc}") from exc
+        raise ClinicError(f"cannot secure Maildir: {exc}") from exc
     pending = db.execute(
         "SELECT * FROM confirmations WHERE dispatched_at IS NULL ORDER BY id"
     ).fetchall()
     written: list[str] = []
     for message in pending:
-        filename = f"confirmation-{message['id']}-{message['recipient_type']}.txt"
-        target = outbox / filename
-        temporary = outbox / f".{filename}.{os.getpid()}.tmp"
-        content = (
-            f"Destination: {message['recipient']}\n"
-            f"Subject: {message['subject']}\n\n{message['body']}\n"
-        )
+        filename = f"civic043-confirmation-{message['id']}.eml"
+        target = maildir / "new" / filename
+        temporary = maildir / "tmp" / f"{filename}.{os.getpid()}.{uuid.uuid4().hex}"
+        email = EmailMessage()
+        email["From"] = sender
+        email["To"] = message["recipient"]
+        email["Subject"] = message["subject"]
+        email["Date"] = format_datetime(datetime.fromisoformat(message["created_at"]))
+        email["Message-ID"] = f"<civic043-confirmation-{message['id']}@clinic.local>"
+        email.set_content(message["body"])
+        content = email.as_bytes(policy=SMTP)
+        if target.exists():
+            try:
+                if target.read_bytes() != content:
+                    raise ClinicError(
+                        f"Maildir already contains different content for confirmation {message['id']}"
+                    )
+            except OSError as exc:
+                raise ClinicError(f"could not inspect confirmation {message['id']}: {exc}") from exc
+            _mark_dispatched(db, message["id"], "maildir", str(target.resolve()))
+            written.append(str(target))
+            continue
         try:
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -496,13 +607,9 @@ def dispatch_confirmations(db: sqlite3.Connection, outbox: Path) -> dict:
             except OSError:
                 pass
             raise ClinicError(f"could not dispatch confirmation {message['id']}: {exc}") from exc
-        with db:
-            db.execute(
-                "UPDATE confirmations SET dispatched_at = ?, output_path = ? WHERE id = ?",
-                (utc_now(), str(target.resolve()), message["id"]),
-            )
+        _mark_dispatched(db, message["id"], "maildir", str(target.resolve()))
         written.append(str(target))
-    return {"dispatched": len(written), "files": written}
+    return {"dispatched": len(written), "transport": "maildir", "files": written}
 
 
 def record_no_show(
@@ -557,7 +664,9 @@ REPORT_FIELDS = (
     "interpreter_no_shows",
     "cancelled_visits",
     "unmatched_visits",
-    "access_rate_percent",
+    "assignment_rate_percent",
+    "delivered_access_visits",
+    "delivered_access_rate_percent",
 )
 
 
@@ -579,7 +688,11 @@ def _report_row(month: str, clinic_name: str, scope: str, language: str, rows: l
         "unmatched_visits": sum(
             row["assigned_interpreter_id"] is None and row["status"] == "requested" for row in rows
         ),
-        "access_rate_percent": f"{(assigned / total * 100) if total else 0:.1f}",
+        "assignment_rate_percent": f"{(assigned / total * 100) if total else 0:.1f}",
+        "delivered_access_visits": statuses["completed"],
+        "delivered_access_rate_percent": (
+            f"{(statuses['completed'] / total * 100) if total else 0:.1f}"
+        ),
     }
 
 
@@ -663,9 +776,10 @@ def build_parser() -> argparse.ArgumentParser:
     schedule_command.add_argument("--appointment", type=int)
 
     dispatch = commands.add_parser(
-        "dispatch-confirmations", help="write pending confirmations to a secure outbox"
+        "dispatch-confirmations", help="deliver pending email confirmations to a Maildir"
     )
-    dispatch.add_argument("--outbox", type=Path, required=True)
+    dispatch.add_argument("--maildir", type=Path, required=True)
+    dispatch.add_argument("--sender", required=True)
 
     no_show = commands.add_parser("record-no-show", help="record a patient or interpreter no-show")
     no_show.add_argument("--appointment", type=int, required=True)
@@ -705,7 +819,7 @@ def run_command(args: argparse.Namespace) -> object:
         if args.command == "schedule":
             return schedule(db, args.appointment)
         if args.command == "dispatch-confirmations":
-            return dispatch_confirmations(db, args.outbox)
+            return dispatch_confirmations_to_maildir(db, args.maildir, args.sender)
         if args.command == "record-no-show":
             return record_no_show(db, args.appointment, args.party, args.note)
         if args.command == "complete":

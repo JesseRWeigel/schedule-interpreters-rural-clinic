@@ -1,8 +1,9 @@
 import csv
-import os
 import stat
 import tempfile
 import unittest
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 
 from src.clinic import (
@@ -11,7 +12,7 @@ from src.clinic import (
     add_availability,
     add_interpreter,
     connect,
-    dispatch_confirmations,
+    dispatch_confirmations_to_maildir,
     init_database,
     monthly_report,
     record_no_show,
@@ -25,6 +26,7 @@ class ClinicSchedulerTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.db_path = self.root / "clinic.db"
         init_database(self.db_path, "Test Rural Clinic")
+        self.assertEqual(stat.S_IMODE(self.db_path.stat().st_mode), 0o600)
         self.db = connect(self.db_path)
 
     def tearDown(self):
@@ -140,13 +142,23 @@ class ClinicSchedulerTests(unittest.TestCase):
         self.assertEqual([item["appointment_id"] for item in schedule_result["scheduled"]], [assigned])
         self.assertEqual([item["appointment_id"] for item in schedule_result["unmatched"]], [unmatched])
 
-        outbox = self.root / "outbox"
-        dispatch = dispatch_confirmations(self.db, outbox)
+        maildir = self.root / "maildir"
+        dispatch = dispatch_confirmations_to_maildir(
+            self.db, maildir, "clinic@clinic.test"
+        )
         self.assertEqual(dispatch["dispatched"], 2)
-        self.assertEqual(dispatch_confirmations(self.db, outbox)["dispatched"], 0)
+        self.assertEqual(
+            dispatch_confirmations_to_maildir(
+                self.db, maildir, "clinic@clinic.test"
+            )["dispatched"],
+            0,
+        )
+        self.assertEqual(stat.S_IMODE(maildir.stat().st_mode), 0o700)
         for path_text in dispatch["files"]:
             path = Path(path_text)
-            self.assertTrue(path.read_text(encoding="utf-8").startswith("Destination:"))
+            message = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
+            self.assertEqual(message["From"], "clinic@clinic.test")
+            self.assertIn("@clinic.test", message["To"])
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
         event = record_no_show(self.db, assigned, "patient", "Clinic follow-up required")
@@ -162,7 +174,46 @@ class ClinicSchedulerTests(unittest.TestCase):
         self.assertEqual(overall["assigned_visits"], "1")
         self.assertEqual(overall["patient_no_shows"], "1")
         self.assertEqual(overall["unmatched_visits"], "1")
-        self.assertEqual(overall["access_rate_percent"], "50.0")
+        self.assertEqual(overall["assignment_rate_percent"], "50.0")
+        self.assertEqual(overall["delivered_access_visits"], "0")
+        self.assertEqual(overall["delivered_access_rate_percent"], "0.0")
+
+    def test_batch_plan_preserves_flexible_interpreter_for_mam(self):
+        flexible = self.add_interpreter(languages=("spanish", "mam"))
+        spanish_only = add_interpreter(
+            self.db,
+            "Interpreter Two",
+            "interpreter-2@clinic.test",
+            ("spanish",),
+            ("video",),
+        )["interpreter_id"]
+        add_availability(self.db, spanish_only, "monday", "08:00", "17:00")
+        spanish_visit = self.add_appointment(language="spanish", patient_ref="PATIENT-001")
+        mam_visit = self.add_appointment(language="mam", patient_ref="PATIENT-002")
+
+        result = schedule(self.db)
+
+        assignments = {
+            row["appointment_id"]: row["interpreter_id"] for row in result["scheduled"]
+        }
+        self.assertEqual(assignments, {spanish_visit: spanish_only, mam_visit: flexible})
+        self.assertEqual(result["unmatched"], [])
+
+    def test_interpreter_no_show_is_not_delivered_access(self):
+        self.add_interpreter()
+        appointment_id = self.add_appointment()
+        schedule(self.db)
+        record_no_show(self.db, appointment_id, "interpreter", "Backup unavailable")
+
+        report_path = self.root / "interpreter-no-show.csv"
+        monthly_report(self.db, "2026-07", report_path)
+        with report_path.open(newline="", encoding="utf-8") as handle:
+            overall = next(csv.DictReader(handle))
+        self.assertEqual(overall["assigned_visits"], "1")
+        self.assertEqual(overall["assignment_rate_percent"], "100.0")
+        self.assertEqual(overall["interpreter_no_shows"], "1")
+        self.assertEqual(overall["delivered_access_visits"], "0")
+        self.assertEqual(overall["delivered_access_rate_percent"], "0.0")
 
     def test_invalid_appointment_and_no_show_state_fail_closed(self):
         with self.assertRaises(ClinicError):
