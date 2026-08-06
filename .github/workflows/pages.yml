@@ -11,7 +11,11 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  # Named per run rather than a shared "pages" group. A shared group means a run that gets stuck
+  # in the github-pages environment blocks every later run forever, and the stuck one cannot
+  # always be cancelled: GitHub returned 502 on both cancel and force-cancel here. A unique group
+  # lets a fresh deploy proceed past a wedged predecessor.
+  group: pages-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
