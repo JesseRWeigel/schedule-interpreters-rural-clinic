@@ -1,0 +1,115 @@
+<title>Interpreter scheduling for a rural clinic</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--ink:#15181c;--dim:#5a636d;--faint:#8a939d;--rule:#e0e5ea;--bg:#f6f8fa;--card:#fff;
+--accent:#1f6f52;--code:#f2f5f7;--shadow:rgba(20,30,45,.06)}
+@media(prefers-color-scheme:dark){:root{--ink:#e7ebef;--dim:#98a2ac;--faint:#6c7681;
+--rule:#2a3038;--bg:#0f1216;--card:#181c22;--accent:#5cb383;--code:#12161a;
+--shadow:rgba(0,0,0,.45)}}
+:root[data-theme="dark"]{--ink:#e7ebef;--dim:#98a2ac;--faint:#6c7681;--rule:#2a3038;
+--bg:#0f1216;--card:#181c22;--accent:#5cb383;--code:#12161a;--shadow:rgba(0,0,0,.45)}
+:root[data-theme="light"]{--ink:#15181c;--dim:#5a636d;--faint:#8a939d;--rule:#e0e5ea;
+--bg:#f6f8fa;--card:#fff;--accent:#1f6f52;--code:#f2f5f7;--shadow:rgba(20,30,45,.06)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.62 ui-sans-serif,system-ui,
+-apple-system,Segoe UI,Roboto,Helvetica,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:52rem;margin:0 auto;padding:3.2rem 1.25rem 5rem}
+.eyebrow{font:600 .68rem/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.14em;
+text-transform:uppercase;color:var(--accent);margin:0 0 1rem}
+h1{font-size:clamp(1.9rem,5vw,2.7rem);line-height:1.08;margin:0 0 .7rem;letter-spacing:-.02em;
+text-wrap:balance}
+.lede{font-size:1.1rem;color:var(--dim);margin:0 0 1.6rem;max-width:36rem}
+.meta{display:flex;flex-wrap:wrap;gap:.5rem 1.4rem;font-size:.86rem;color:var(--faint);
+padding-bottom:1.6rem;border-bottom:1px solid var(--rule);margin-bottom:2.4rem}
+.meta a{color:var(--accent)}
+h2{font-size:.72rem;font-weight:650;letter-spacing:.1em;text-transform:uppercase;
+color:var(--faint);margin:2.6rem 0 .8rem}
+p{max-width:38rem}
+.note{color:var(--dim);font-size:.93rem;max-width:38rem}
+pre{background:var(--code);border:1px solid var(--rule);border-radius:9px;padding:1rem 1.1rem;
+overflow-x:auto;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:0}
+pre + .note{margin-top:.7rem}
+.cmd{color:var(--accent);font-weight:600}
+.card{background:var(--card);border:1px solid var(--rule);border-radius:11px;padding:1.3rem;
+box-shadow:0 1px 3px var(--shadow);margin-bottom:1rem}
+ul{max-width:38rem;padding-left:1.1rem}
+li{margin:.35rem 0}
+footer{margin-top:3.4rem;padding-top:1.3rem;border-top:1px solid var(--rule);color:var(--faint);
+font-size:.83rem;line-height:1.7}
+footer a{color:var(--accent)}
+</style>
+<div class="wrap">
+<p class="eyebrow">Command line tool</p>
+<h1>Interpreter scheduling for a rural clinic</h1>
+<p class="lede">Matches contract interpreters to appointments by language, modality and availability, and says why it could not match the ones it could not.</p>
+<div class="meta"><span><a href="https://github.com/JesseRWeigel/schedule-interpreters-rural-clinic">Source on GitHub</a></span><span>Python 3, no dependencies, SQLite on disk</span></div>
+<h2>The problem</h2>
+<p>A clinic serving immigrant patients books a handful of contract interpreters across several languages. A missed match is a cancelled appointment, and the person who loses the visit is the one least able to reschedule it. The scheduling itself is small; the part that matters is knowing, for each appointment nobody can cover, which constraint actually failed.</p>
+<h2>Two interpreters, three appointments</h2>
+<p>One speaks Spanish and Mam and works by phone or video. One speaks Amharic and works by phone only. Three patients need Spanish, Amharic and Karen.</p>
+<pre><span class="cmd">$ clinic_scheduler.py --db clinic.db schedule</span>
+{
+  &quot;scheduled&quot;: [
+    {
+      &quot;appointment_id&quot;: 1,
+      &quot;interpreter&quot;: &quot;A. Reyes&quot;,
+      &quot;interpreter_id&quot;: 1
+    },
+    {
+      &quot;appointment_id&quot;: 2,
+      &quot;interpreter&quot;: &quot;B. Osei&quot;,
+      &quot;interpreter_id&quot;: 2
+    }
+  ],
+  &quot;unmatched&quot;: [
+    {
+      &quot;active_interpreters&quot;: 2,
+      &quot;appointment_id&quot;: 3,
+      &quot;failed_availability&quot;: 0,
+      &quot;failed_conflict&quot;: 0,
+      &quot;failed_language&quot;: 2,
+      &quot;failed_modality&quot;: 0
+    }
+  ]
+}</pre>
+<p class="note">Two matched. The third is unmatched, and the diagnostic says why: <code>failed_language: 2</code> means both interpreters were free and available and neither speaks Karen. A scheduler that only reported the failure would leave a coordinator guessing between a rota problem and a hiring problem. These are different problems.</p>
+<h2>The whole roster after scheduling</h2>
+<pre><span class="cmd">$ clinic_scheduler.py --db clinic.db list-appointments</span>
+[
+  {
+    &quot;assigned_interpreter_id&quot;: 1,
+    &quot;ends_at&quot;: &quot;2026-08-10T09:30&quot;,
+    &quot;id&quot;: 1,
+    &quot;interpreter&quot;: &quot;A. Reyes&quot;,
+    &quot;language&quot;: &quot;spanish&quot;,
+    &quot;modality&quot;: &quot;video&quot;,
+    &quot;patient_ref&quot;: &quot;P-1001&quot;,
+    &quot;starts_at&quot;: &quot;2026-08-10T09:00&quot;,
+    &quot;status&quot;: &quot;scheduled&quot;
+  },
+  {
+    &quot;assigned_interpreter_id&quot;: 2,
+    &quot;ends_at&quot;: &quot;2026-08-10T10:45&quot;,
+    &quot;id&quot;: 2,
+    &quot;interpreter&quot;: &quot;B. Osei&quot;,
+    &quot;language&quot;: &quot;amharic&quot;,
+    &quot;modality&quot;: &quot;phone&quot;,
+    &quot;patient_ref&quot;: &quot;P-1002&quot;,
+    &quot;starts_at&quot;: &quot;2026-08-10T10:00&quot;,
+    &quot;status&quot;: &quot;scheduled&quot;
+  },
+  {
+    &quot;assigned_interpreter_id&quot;: null,
+    &quot;ends_at&quot;: &quot;2026-08-10T11:30&quot;,
+    &quot;id&quot;: 3,
+    &quot;interpreter&quot;: null,
+    &quot;language&quot;: &quot;karen&quot;,
+    &quot;modality&quot;: &quot;phone&quot;,
+    &quot;patient_ref&quot;: &quot;P-1003&quot;,
+    &quot;starts_at&quot;: &quot;2026-08-10T11:00&quot;,
+    &quot;status&quot;: &quot;requested&quot;
+  }
+]</pre>
+<h2>What else it does</h2>
+<p><ul><li>Weekly recurring availability per interpreter, checked against appointment times</li><li>Conflict detection, so nobody is booked twice</li><li>Confirmation dispatch through a local mail transfer agent</li><li>No-show recording for patients and interpreters separately</li><li>A monthly CSV for Title VI language-access documentation</li></ul></p>
+<footer>Everything on this page was produced by running the tool. <a href="https://github.com/JesseRWeigel/schedule-interpreters-rural-clinic">Source</a> &middot; one of a public catalog of build ideas at <a href="https://github.com/JesseRWeigel/722-things-to-build">722-things-to-build</a>.</footer></div>

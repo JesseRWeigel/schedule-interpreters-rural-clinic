@@ -1,5 +1,7 @@
 # Rural Clinic Interpreter Scheduler
 
+**[See it matching interpreters](https://jesserweigel.github.io/schedule-interpreters-rural-clinic/)**
+
 Clinics serving immigrant patients juggle a handful of contract interpreters across languages and appointment times, and a missed match means a canceled visit. Build a scheduler that matches appointment language, modality (in person, phone, video), and interpreter availability, sends confirmations, tracks no-shows, and produces a monthly language-access report for Title VI documentation.
 
 Catalog task: `CIVIC-043`. One of a public catalog of build ideas: https://github.com/JesseRWeigel/722-things-to-build
